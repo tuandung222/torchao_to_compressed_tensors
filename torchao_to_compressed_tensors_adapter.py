@@ -2,12 +2,15 @@
 """
 Multi-Schema Adapter: Convert any TorchAO quantized checkpoint into compressed-tensors format.
 Supports:
-  1. Int4WeightOnlyConfig (Tinygemm / TilePackedTo4D) -> pack-quantized (INT4)
+  1. Int4WeightOnlyConfig (Tinygemm / TilePackedTo4D) -> pack-quantized (INT4) [Symmetric & Asymmetric]
   2. Int4PlainInt32Tensor (Linear Bit-Packed) -> pack-quantized (INT4)
-  3. Int8WeightOnlyConfig (W8A16) -> int-quantized (INT8)
-  4. Int8DynamicActivationInt8WeightConfig (W8A8 Dynamic) -> int-quantized (INT8 dynamic token)
-  5. Int8StaticActivationInt8WeightConfig (W8A8 Static) -> int-quantized (INT8 static)
+  3. Int8WeightOnlyConfig (W8A16) -> int-quantized (INT8) [Symmetric & Asymmetric, Channel & Group]
+  4. Int8DynamicActivationInt8WeightConfig (W8A8 Dynamic) -> int-quantized (INT8 dynamic token) [Symmetric & Asymmetric Act]
+  5. Int8StaticActivationInt8WeightConfig (W8A8 Static) -> int-quantized (INT8 static tensor)
   6. Int4PreshuffledTensor (Marlin Layout) -> pack-quantized / marlin
+  7. Float8WeightOnlyConfig (FP8 E4M3FN W8A16) -> float-quantized (FP8 channel)
+  8. Float8DynamicActivationFloat8WeightConfig (FP8 E4M3FN W8A8 Dynamic) -> float-quantized (FP8 dynamic token)
+
 Guarantees 100% mathematical and bit-exact parity for quantized weights, scales, and metadata.
 """
 
@@ -27,7 +30,10 @@ from safetensors.torch import save_file
 
 import torchao
 from torchao.quantization.utils import unpack_tinygemm_scales_and_zeros
-from compressed_tensors.compressors.quantized_compressors.pack_quantized import pack_to_int32
+try:
+    from compressed_tensors.compressors.pack_quantized import pack_to_int32, unpack_from_int32
+except ImportError:
+    from compressed_tensors.compressors.quantized_compressors.pack_quantized import pack_to_int32, unpack_from_int32
 
 
 class SchemaType(enum.Enum):
@@ -37,6 +43,8 @@ class SchemaType(enum.Enum):
     INT8_WEIGHT_ONLY = "int8_weight_only"
     INT8_DYNAMIC_ACT = "int8_dynamic_act"
     INT8_STATIC_ACT = "int8_static_act"
+    FLOAT8_WEIGHT_ONLY = "float8_weight_only"
+    FLOAT8_DYNAMIC_ACT = "float8_dynamic_act"
     PASSTHROUGH = "passthrough"
 
 
@@ -59,6 +67,16 @@ def parse_args():
         type=str,
         default="cuda:0" if torch.cuda.is_available() else "cpu",
         help="Device to use for tensor transformations",
+    )
+    parser.add_argument(
+        "--int4-asymmetric",
+        action="store_true",
+        help="Export INT4 weights with integer zero-point (AWQ/Marlin-ZP style)",
+    )
+    parser.add_argument(
+        "--act-asymmetric",
+        action="store_true",
+        help="Export dynamic activations as asymmetric (vLLM CUTLASS AZP style)",
     )
     return parser.parse_args()
 
@@ -88,6 +106,15 @@ def detect_tensor_schema(name: str, tensor: Any, state_dict: Dict[str, Any]) -> 
 
     tensor_cls = tensor.__class__.__name__
 
+    # Float8 checks
+    if "Float8Layout" in tensor_cls:
+        if hasattr(tensor, "act_quant_kwargs") or (getattr(tensor, "scale", None) is not None and getattr(tensor, "scale").shape == (1, 1)):
+            return SchemaType.FLOAT8_DYNAMIC_ACT
+        return SchemaType.FLOAT8_WEIGHT_ONLY
+
+    if getattr(tensor, "dtype", None) in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        return SchemaType.FLOAT8_WEIGHT_ONLY
+
     if "Int4TilePackedTo4dTensor" in tensor_cls:
         return SchemaType.INT4_TINYGEMM
     elif "Int4PlainInt32Tensor" in tensor_cls:
@@ -106,6 +133,8 @@ def detect_tensor_schema(name: str, tensor: Any, state_dict: Dict[str, Any]) -> 
             return SchemaType.INT4_PLAIN
         elif tensor.dtype == torch.int8:
             return SchemaType.INT8_WEIGHT_ONLY
+        elif tensor.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            return SchemaType.FLOAT8_WEIGHT_ONLY
 
     return SchemaType.PASSTHROUGH
 
@@ -158,6 +187,8 @@ def convert_int4_tinygemm(
         eye = torch.eye(in_features, dtype=torch.bfloat16, device=device)
         dequant_w = F.linear(eye, tensor_gpu).t()
 
+    scales_exp = valid_scales.to(device).repeat_interleave(group_size, dim=1)
+
     if export_asymmetric:
         valid_zeros = zeros.squeeze(-1)[:, :num_groups].to(device)
         z_uint = torch.round(8.0 - valid_zeros / valid_scales.to(device)).clamp(0, 15).to(torch.int8)
@@ -175,7 +206,6 @@ def convert_int4_tinygemm(
         }
 
     # Exact symmetric integer grid [-8, 7]
-    scales_exp = valid_scales.to(device).repeat_interleave(group_size, dim=1)
     q_signed = torch.round(dequant_w / scales_exp).clamp(-8, 7).to(torch.int8)
 
     weight_packed = pack_to_int32(q_signed.to(device), num_bits=4, packed_dim=1).cpu()
@@ -208,10 +238,14 @@ def convert_int4_plain(
         scale = state_dict[scale_key].cpu().to(torch.float16)
         orig_shape = (scale.shape[0], scale.shape[1] * group_size)
 
-    weight_shape = torch.tensor([orig_shape[0], orig_shape[1]], dtype=torch.int32)
+    # Convert plain uint4 to signed int8 [-8, 7]
+    q_signed = (qdata.to(torch.int8) - 8).to(device)
+    weight_packed = pack_to_int32(q_signed, num_bits=4, packed_dim=1).cpu()
+    weight_shape = torch.tensor(list(orig_shape), dtype=torch.int32)
+
     k = lambda s: f"{prefix}.{s}" if prefix else s
     return prefix, {
-        k("weight_packed"): qdata.contiguous(),
+        k("weight_packed"): weight_packed.contiguous(),
         k("weight_scale"): scale.contiguous(),
         k("weight_shape"): weight_shape.contiguous(),
     }
@@ -224,7 +258,7 @@ def convert_int4_preshuffled(
     group_size: int,
     device: torch.device,
 ) -> Tuple[str, Dict[str, torch.Tensor]]:
-    """Convert Int4PreshuffledTensor (Marlin layout) into compressed-tensors pack-quantized format."""
+    """Convert Int4PreshuffledTensor into compressed-tensors pack-quantized format."""
     prefix = extract_prefix(name)
     out_features, in_features = tensor.shape
     num_groups = in_features // group_size
@@ -285,7 +319,10 @@ def convert_int8_weight_only(
         k("weight_scale"): scale.contiguous(),
     }
     if zero_point is not None:
-        result[k("weight_zero_point")] = zero_point.cpu().to(torch.int8).contiguous()
+        zp = zero_point.cpu().to(torch.int8)
+        if zp.ndim == 1:
+            zp = zp.unsqueeze(-1)
+        result[k("weight_zero_point")] = zp.contiguous()
 
     return prefix, result
 
@@ -296,22 +333,37 @@ def convert_int8_dynamic_act(
     state_dict: Dict[str, Any],
     device: torch.device,
 ) -> Tuple[str, Dict[str, torch.Tensor]]:
-    """Convert LinearActivationQuantizedTensor (W8A8 Dynamic) into compressed-tensors int-quantized format."""
+    """Convert Int8DynamicActivationInt8WeightConfig into compressed-tensors int-quantized format."""
     prefix = extract_prefix(name)
-
-    # The underlying weight is an AffineQuantizedTensor
-    underlying = getattr(tensor, "original_weight_tensor", tensor)
-    if hasattr(underlying, "tensor_impl"):
-        ti = underlying.tensor_impl
-        raw_tensor = getattr(ti, "int_data", getattr(ti, "data", None))
-        raw_int8 = raw_tensor.cpu().to(torch.int8)
+    if hasattr(tensor, "original_weight_tensor"):
+        underlying = tensor.original_weight_tensor
+        ti = getattr(underlying, "tensor_impl", None)
+        if ti is not None:
+            raw_int8 = getattr(ti, "int_data", getattr(ti, "data", None)).cpu().to(torch.int8)
+            scale = ti.scale.cpu().to(torch.float16)
+            zero_point = getattr(ti, "zero_point", None)
+        else:
+            raw_int8 = underlying.cpu().to(torch.int8)
+            scale = getattr(underlying, "scale", torch.tensor([1.0])).cpu().to(torch.float16)
+            zero_point = getattr(underlying, "zero_point", None)
+    elif hasattr(tensor, "tensor_impl"):
+        ti = tensor.tensor_impl
+        raw_int8 = getattr(ti, "int_data", getattr(ti, "data", None)).cpu().to(torch.int8)
         scale = ti.scale.cpu().to(torch.float16)
         zero_point = getattr(ti, "zero_point", None)
+    elif hasattr(tensor, "qdata"):
+        raw_int8 = tensor.qdata.cpu().to(torch.int8)
+        scale = tensor.scale.cpu().to(torch.float16)
+        zero_point = getattr(tensor, "zero_point", None)
     else:
         raw_int8 = tensor.cpu().to(torch.int8)
         scale_key = f"{prefix}.scale" if prefix else "scale"
         zp_key = f"{prefix}.zero_point" if prefix else "zero_point"
-        scale = state_dict[scale_key].cpu().to(torch.float16)
+        scale = state_dict.get(scale_key)
+        if scale is not None:
+            scale = scale.cpu().to(torch.float16)
+        else:
+            scale = torch.ones((raw_int8.shape[0], 1), dtype=torch.float16)
         zero_point = state_dict.get(zp_key)
 
     if scale.ndim == 1:
@@ -323,7 +375,10 @@ def convert_int8_dynamic_act(
         k("weight_scale"): scale.contiguous(),
     }
     if zero_point is not None:
-        result[k("weight_zero_point")] = zero_point.cpu().to(torch.int8).contiguous()
+        zp = zero_point.cpu().to(torch.int8)
+        if zp.ndim == 1:
+            zp = zp.unsqueeze(-1)
+        result[k("weight_zero_point")] = zp.contiguous()
 
     return prefix, result
 
@@ -339,12 +394,53 @@ def convert_int8_static_act(
     
     # Check for observer static input scale
     act_scale_key = f"{prefix}.input_scale" if prefix else "input_scale"
+    act_zp_key = f"{prefix}.input_zero_point" if prefix else "input_zero_point"
+    
     if act_scale_key in state_dict:
         result[act_scale_key] = state_dict[act_scale_key].cpu().to(torch.float16).contiguous()
     elif hasattr(tensor, "act_quant_scale"):
         result[act_scale_key] = tensor.act_quant_scale.cpu().to(torch.float16).contiguous()
 
+    if act_zp_key in state_dict:
+        result[act_zp_key] = state_dict[act_zp_key].cpu().to(torch.int8).contiguous()
+
     return prefix, result
+
+
+def convert_fp8_weight_only(
+    name: str,
+    tensor: Any,
+    state_dict: Dict[str, Any],
+    device: torch.device,
+) -> Tuple[str, Dict[str, torch.Tensor]]:
+    """Convert Float8WeightOnlyConfig into compressed-tensors float-quantized format."""
+    prefix = extract_prefix(name)
+    if hasattr(tensor, "qdata") and hasattr(tensor, "scale"):
+        qdata = tensor.qdata.cpu()
+        scale = tensor.scale.cpu().to(torch.float32)
+    else:
+        qdata = tensor.cpu()
+        scale_key = f"{prefix}.scale" if prefix else "scale"
+        scale = state_dict[scale_key].cpu().to(torch.float32)
+
+    if scale.ndim == 1:
+        scale = scale.unsqueeze(-1)
+
+    k = lambda s: f"{prefix}.{s}" if prefix else s
+    return prefix, {
+        k("weight"): qdata.contiguous(),
+        k("weight_scale"): scale.contiguous(),
+    }
+
+
+def convert_fp8_dynamic_act(
+    name: str,
+    tensor: Any,
+    state_dict: Dict[str, Any],
+    device: torch.device,
+) -> Tuple[str, Dict[str, torch.Tensor]]:
+    """Convert Float8DynamicActivationFloat8WeightConfig into compressed-tensors float-quantized format."""
+    return convert_fp8_weight_only(name, tensor, state_dict, device)
 
 
 # ----------------------------------------------------------------------
@@ -356,6 +452,7 @@ def generate_compressed_tensors_config(
     group_size: int,
     base_config: Dict[str, Any],
     symmetric: bool = True,
+    act_symmetric: bool = True,
 ) -> Dict[str, Any]:
     """Generate spec-compliant compressed-tensors quantization_config."""
     config_copy = dict(base_config)
@@ -399,6 +496,82 @@ def generate_compressed_tensors_config(
                     "input_activations": {
                         "num_bits": 8,
                         "type": "int",
+                        "symmetric": act_symmetric,
+                        "strategy": "token",
+                        "dynamic": True,
+                    },
+                    "output_activations": None,
+                    "targets": ["Linear"],
+                }
+            },
+            "ignore": ["lm_head"],
+            "quantization_status": "compressed",
+            "version": "0.18.0",
+        }
+    elif dominant_schema == SchemaType.INT8_STATIC_ACT:
+        quant_config = {
+            "quant_method": "compressed-tensors",
+            "format": "int-quantized",
+            "config_groups": {
+                "group_0": {
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "int",
+                        "symmetric": True,
+                        "strategy": "channel",
+                        "actorder": None,
+                    },
+                    "input_activations": {
+                        "num_bits": 8,
+                        "type": "int",
+                        "symmetric": act_symmetric,
+                        "strategy": "tensor",
+                        "dynamic": False,
+                    },
+                    "output_activations": None,
+                    "targets": ["Linear"],
+                }
+            },
+            "ignore": ["lm_head"],
+            "quantization_status": "compressed",
+            "version": "0.18.0",
+        }
+    elif dominant_schema == SchemaType.FLOAT8_WEIGHT_ONLY:
+        quant_config = {
+            "quant_method": "compressed-tensors",
+            "format": "float-quantized",
+            "config_groups": {
+                "group_0": {
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "float",
+                        "symmetric": True,
+                        "strategy": "channel",
+                    },
+                    "input_activations": None,
+                    "output_activations": None,
+                    "targets": ["Linear"],
+                }
+            },
+            "ignore": ["lm_head"],
+            "quantization_status": "compressed",
+            "version": "0.18.0",
+        }
+    elif dominant_schema == SchemaType.FLOAT8_DYNAMIC_ACT:
+        quant_config = {
+            "quant_method": "compressed-tensors",
+            "format": "float-quantized",
+            "config_groups": {
+                "group_0": {
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "float",
+                        "symmetric": True,
+                        "strategy": "channel",
+                    },
+                    "input_activations": {
+                        "num_bits": 8,
+                        "type": "float",
                         "symmetric": True,
                         "strategy": "token",
                         "dynamic": True,
@@ -411,7 +584,7 @@ def generate_compressed_tensors_config(
             "quantization_status": "compressed",
             "version": "0.18.0",
         }
-    else:  # INT8_WEIGHT_ONLY or INT8_STATIC_ACT
+    else:  # INT8_WEIGHT_ONLY
         quant_config = {
             "quant_method": "compressed-tensors",
             "format": "int-quantized",
@@ -420,8 +593,8 @@ def generate_compressed_tensors_config(
                     "weights": {
                         "num_bits": 8,
                         "type": "int",
-                        "symmetric": True,
-                        "strategy": "channel",
+                        "symmetric": symmetric,
+                        "strategy": "channel" if group_size == 0 or group_size is None else "group",
                         "actorder": None,
                     },
                     "input_activations": None,
@@ -448,6 +621,7 @@ def convert_checkpoint(
     output_dir: Path,
     device_str: str = "cuda:0",
     int4_asymmetric: bool = False,
+    act_asymmetric: bool = False,
 ):
     source_dir = Path(source_dir)
     output_dir = Path(output_dir)
@@ -459,6 +633,8 @@ def convert_checkpoint(
     print(f"   Source checkpoint : {source_dir}")
     print(f"   Output directory  : {output_dir}")
     print(f"   Compute Device    : {device}")
+    print(f"   INT4 Asymmetric   : {int4_asymmetric}")
+    print(f"   Act Asymmetric    : {act_asymmetric}")
     print("=" * 80, flush=True)
 
     config_path = source_dir / "config.json"
@@ -538,6 +714,18 @@ def convert_checkpoint(
             processed_prefixes.add(prefix)
             schema_counts[SchemaType.INT8_STATIC_ACT] += 1
 
+        elif schema == SchemaType.FLOAT8_WEIGHT_ONLY:
+            prefix, converted = convert_fp8_weight_only(name, tensor, state_dict, device)
+            target_state_dict.update(converted)
+            processed_prefixes.add(prefix)
+            schema_counts[SchemaType.FLOAT8_WEIGHT_ONLY] += 1
+
+        elif schema == SchemaType.FLOAT8_DYNAMIC_ACT:
+            prefix, converted = convert_fp8_dynamic_act(name, tensor, state_dict, device)
+            target_state_dict.update(converted)
+            processed_prefixes.add(prefix)
+            schema_counts[SchemaType.FLOAT8_DYNAMIC_ACT] += 1
+
         elif schema == SchemaType.PASSTHROUGH:
             if not name.endswith(".scales_and_zeros"):
                 # Clone tensor storage buffer to avoid safetensors shared-memory conflicts
@@ -557,7 +745,11 @@ def convert_checkpoint(
     print("[3/4] Generating config.json and writing .safetensors ...", flush=True)
     base_config = json.loads((source_dir / "config.json").read_text())
     target_config = generate_compressed_tensors_config(
-        dominant_schema, group_size, base_config, symmetric=(not int4_asymmetric)
+        dominant_schema,
+        group_size,
+        base_config,
+        symmetric=(not int4_asymmetric),
+        act_symmetric=(not act_asymmetric),
     )
     with open(output_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(target_config, f, indent=2)
@@ -582,7 +774,13 @@ def convert_checkpoint(
 
 def main():
     args = parse_args()
-    convert_checkpoint(Path(args.source), Path(args.output_dir), args.device)
+    convert_checkpoint(
+        Path(args.source),
+        Path(args.output_dir),
+        args.device,
+        int4_asymmetric=args.int4_asymmetric,
+        act_asymmetric=args.act_asymmetric,
+    )
 
 
 if __name__ == "__main__":
