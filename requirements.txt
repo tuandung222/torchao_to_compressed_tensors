@@ -1,0 +1,6 @@
+torch>=2.4.0
+torchao>=0.5.0
+compressed-tensors>=0.8.0
+transformers>=4.44.0
+safetensors>=0.4.3
+accelerate>=0.30.0

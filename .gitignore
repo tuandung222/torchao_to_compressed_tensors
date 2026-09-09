@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoint model weights (large binary files >100MB)
+checkpoints/**/*.bin
+checkpoints/**/*.safetensors
+checkpoints/**/*.pt
+checkpoints/**/*.pth
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE & OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs & scratch
+*.log
+scratch/
