@@ -3,15 +3,23 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Checkpoint model weights (large binary files >100MB)
-checkpoints/**/*.bin
-checkpoints/**/*.safetensors
-checkpoints/**/*.pt
-checkpoints/**/*.pth
+# Checkpoint model weights and generated directories
+checkpoints/
 *.bin
 *.safetensors
 *.pt
 *.pth
+
+# Packaging & Build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Environments
 .env

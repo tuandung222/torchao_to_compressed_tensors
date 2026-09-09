@@ -1,12 +1,52 @@
 # TorchAO to Compressed-Tensors Adapter
 
-A high-performance, modular quantization adapter and verification suite that transforms **PyTorch TorchAO** quantized checkpoints into **`compressed-tensors`** (`.safetensors`) format for high-throughput inference on **vLLM**, **SGLang**, and **HuggingFace Transformers**.
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-blue)](pyproject.toml)
+[![CI](https://github.com/tuandung222/torchao_to_compressed_tensors/actions/workflows/ci.yml/badge.svg)](https://github.com/tuandung222/torchao_to_compressed_tensors/actions)
+[![Quantization](https://img.shields.io/badge/Format-Compressed--Tensors%20(vLLM)-green.svg)](https://github.com/vllm-project/vllm)
+
+A production-grade, modular quantization adapter and verification engine that converts **PyTorch TorchAO** quantized checkpoints into **`compressed-tensors`** (`.safetensors`) format for high-throughput inference on **vLLM**, **SGLang**, and **HuggingFace Transformers**.
+
+---
+
+## 📁 Repository Structure
+
+```text
+torchao_to_compressed_tensors/
+├── src/
+│   └── torchao_to_compressed_tensors/
+│       ├── __init__.py             # Public package exports
+│       ├── adapter.py              # Main checkpoint conversion engine & CLI
+│       ├── schemas.py              # Schema types & detection logic
+│       ├── handlers.py             # Modular converters (INT4, INT8, FP8)
+│       └── config.py               # Spec-compliant config.json generator
+├── tests/
+│   ├── __init__.py
+│   ├── test_parity.py              # 4-tier parity verification test suite
+│   └── generate_dummy_model.py     # Deterministic dummy model generator
+├── examples/
+│   ├── smoke_qat_finetune.py       # TorchAO QAT fine-tuning demonstration
+│   ├── verify_inference.py         # vLLM / Transformers inference demo
+│   ├── run_pipeline.sh             # End-to-end automation pipeline
+│   └── data/                       # Sample demonstration datasets
+├── .github/
+│   └── workflows/
+│       └── ci.yml                  # GitHub Actions CI workflow
+├── pyproject.toml                  # Modern PEP 517/621 package metadata
+├── setup.py                        # Backward-compatible package installer
+├── requirements.txt                # Dependency specifications
+├── LICENSE                         # Apache 2.0 License
+├── README.md                       # Documentation and architecture guide
+├── torchao_to_compressed_tensors_adapter.py  # Root CLI backward-compatibility shim
+└── test_converter_parity.py                  # Root test backward-compatibility shim
+```
 
 ---
 
 ## 🚀 Key Features
 
-- **Full Multi-Schema Coverage**: Modular dispatcher supporting all production-deployable TorchAO quantization schemas:
+- **Modular Architecture (`src-layout`)**: Cleanly organized into separate schema detection, transformation handlers, and configuration generators.
+- **Full Multi-Schema Coverage**: Supports all deployable TorchAO quantization schemas:
   - `Int8WeightOnlyConfig` (W8A16): **100% Bit-Exact** (`torch.equal == True`, Cosine = 1.000000).
   - `Int8DynamicActivationInt8WeightConfig` (W8A8 Dynamic Token): **100% Bit-Exact** weights & scales, supports both symmetric and asymmetric activations.
   - `Int8StaticActivationInt8WeightConfig` (W8A8 Static): **100% Bit-Exact** weights & calibrated activation scales.
@@ -16,24 +56,24 @@ A high-performance, modular quantization adapter and verification suite that tra
   - `Int4PreshuffledTensor` (W4A16 Marlin layout): Lossless layout de-shuffling.
   - `Int4WeightOnlyConfig` (TinyGEMM / `Int4TilePackedTo4dTensor`): High-fidelity affine projection supporting both **Symmetric** (Marlin / vLLM standard) and **Asymmetric** (`has_zp=True` runtime integer zero-points).
 - **Automated Multi-Tier Parity Verification Suite**: Validates conversion integrity at bit level, dequantization level, forward logits invariance, and end-to-end inference generation.
-- **Spec-Compliant Config Generation**: Generates clean, pydantic-compliant `quantization_config` adhering to `compressed-tensors` v0.13.0 - v0.18.0.
-- **Safe Pickle-Free Serialization**: Exports directly to `.safetensors`, automatically isolating tied memory buffers (e.g. `embed_tokens` and `lm_head`) to avoid duplicate key errors.
+- **Dedicated CLI Entrypoint**: Installed as `torchao-to-ct` via standard pip installation.
+- **Safe Pickle-Free Serialization**: Exports directly to `.safetensors`, automatically isolating tied memory buffers to avoid duplicate key errors.
 
 ---
 
 ## 📊 Supported Schemas & Parity Matrix
 
-| TorchAO Schema | Implementation Class | Memory Layout | Mathematical Nature in Compressed-Tensors |
+| TorchAO Schema | Implementation Class | Target Compressed-Tensors Format | Mathematical Parity |
 |---|---|---|---|
-| **Int8 Weight-Only** | `AffineQuantizedTensor` | Pure `torch.int8` + per-channel float scale | **100% Bit-Exact** (`torch.equal == True`, Scale Diff = 0.0, Cosine = 1.000000) |
-| **Int8 Dynamic Activation** | `LinearActivationQuantizedTensor` | `torch.int8` + token dynamic activation quant | **100% Bit-Exact** (`torch.equal == True`, `"dynamic": true, "strategy": "token"`) |
-| **Int8 Static Activation** | `AffineQuantizedTensor` + observer | `torch.int8` + calibrated `input_scale` | **100% Bit-Exact** (Exact weight + static activation scale) |
-| **Float8 Weight-Only** | `Float8Layout` (`e4m3fn`) | FP8 E4M3FN + per-channel float32 scale | **100% Bit-Exact** (`torch.equal == True`, Cosine = 1.000000) |
-| **Float8 Dynamic Act** | `Float8Layout` (`e4m3fn`) | FP8 E4M3FN + dynamic token act quant | **100% Bit-Exact** (`torch.equal == True`, `"strategy": "token"`) |
-| **Int4 Plain Int32** | `Int4PlainInt32Tensor` | Contiguous row-major `torch.int32` | **100% Bit-Exact** (`torch.equal == True`) |
-| **Int4 Marlin Preshuffled** | `Int4PreshuffledTensor` | $16 \times 64$ permuted hardware layout | **100% Lossless** (De-permuted back to canonical container) |
-| **Int4 TinyGEMM (Symmetric)** | `Int4TilePackedTo4dTensor` | 4D tile-packed + float zero-point $z_f$ | **Affine Projection** (Cosine $\ge 0.9994$) |
-| **Int4 TinyGEMM (Asymmetric)** | `Int4TilePackedTo4dTensor` | 4D tile-packed + exported `weight_zero_point` | **Asymmetric Marlin / AWQ** (`has_zp=True`, integer grid $[0, 15]$) |
+| **Int8 Weight-Only** | `AffineQuantizedTensor` | `format: "int-quantized"`, `strategy: "channel"` | **100% Bit-Exact** (`torch.equal == True`, Cosine = 1.0) |
+| **Int8 Dynamic Act** | `LinearActivationQuantizedTensor` | `format: "int-quantized"`, dynamic token act | **100% Bit-Exact** (Cosine = 1.0) |
+| **Int8 Static Act** | `AffineQuantizedTensor` + observer | `format: "int-quantized"`, static tensor act | **100% Bit-Exact** |
+| **Float8 Weight-Only** | `Float8Layout` (`e4m3fn`) | `format: "float-quantized"`, FP8 channel | **100% Bit-Exact** (Cosine = 1.0) |
+| **Float8 Dynamic Act** | `Float8Layout` (`e4m3fn`) | `format: "float-quantized"`, FP8 dynamic token | **100% Bit-Exact** (Cosine = 1.0) |
+| **Int4 Plain Int32** | `Int4PlainInt32Tensor` | `format: "pack-quantized"`, INT32 container | **100% Bit-Exact** (`torch.equal == True`) |
+| **Int4 Marlin Preshuffled** | `Int4PreshuffledTensor` | `format: "pack-quantized"`, de-shuffled Marlin | **100% Lossless** |
+| **Int4 TinyGEMM (Symmetric)** | `Int4TilePackedTo4dTensor` | `format: "pack-quantized"`, Marlin `has_zp=False` | **Affine Projection** (Cosine $\ge 0.9994$) |
+| **Int4 TinyGEMM (Asymmetric)** | `Int4TilePackedTo4dTensor` | `format: "pack-quantized"`, Marlin `has_zp=True` | **Asymmetric Marlin / AWQ** (Integer grid $[0, 15]$) |
 
 ---
 
@@ -49,7 +89,7 @@ When mapping to target inference engines (Marlin / Compressed-Tensors):
    Eliminates the floating offset degree of freedom $z_f$. To be identical for all quantization levels requires $s_M = s$ and $z_f = 0$, which does not hold in general.
 2. **Asymmetric Target (Marlin `has_zp=True` / AWQ uint4 + runtime ZP)**:
    $$\hat{w}^A = (q - z_i)s_A, \quad z_i \in \mathbb{Z}$$
-   For bit-exact equivalence, one would require $z_i = 8 - \frac{z_f}{s_T}$. Because $\frac{z_f}{s_T} \notin \mathbb{Z}$ in general (empirically measuring $\frac{z_f}{s_T} \approx 4.0625$), rounding to the nearest integer $z_i^* \in \mathbb{Z}$ still leaves a fractional truncation error.
+   For bit-exact equivalence, one would require $z_i = 8 - \frac{z_f}{s_T}$. Because $\frac{z_f}{s_T} \notin \mathbb{Z}$ in general (empirically measuring $\frac{z_f}{s_T} \approx 4.0625$), rounding to the nearest integer $z_i^* \in \mathbb{Z}$ leaves a small fractional truncation error.
 
 Hence:
 $$\text{FLOAT-ZP TinyGEMM} \not\equiv \text{INT-ZP Marlin}$$
@@ -61,14 +101,18 @@ The adapter provides both options:
 
 ## 🧪 Comprehensive Parity Verification Test Suite
 
-The test suite [`test_converter_parity.py`](test_converter_parity.py) executes 4 rigorous validation tiers:
+Run the full 4-tier test suite on GPU:
 
 ```bash
-python test_converter_parity.py
+# Run via pytest
+pytest tests/test_parity.py -v
+
+# Or run directly via test script
+python tests/test_parity.py
 ```
 
 ### Verification Results Summary:
-```
+```text
 ================================================================================
 🚀 RUNNING COMPREHENSIVE MULTI-SCHEMA PARITY VERIFICATION SUITE
    Compute Device : cuda:0
@@ -128,17 +172,42 @@ FP8 Forward Pass Output Parity:
 
 ---
 
-## 🛠️ Usage
+## 🛠️ Installation & Usage
 
 ### 1. Installation
+
 ```bash
+# Install directly from source in editable mode
+pip install -e .
+
+# Or install from requirements.txt
 pip install -r requirements.txt
 ```
 
-### 2. Checkpoint Conversion (Python API)
+### 2. Command Line Interface (CLI)
+
+Use either the installed `torchao-to-ct` console script or the python module:
+
+```bash
+# Standard conversion (Symmetric INT4, INT8, FP8)
+torchao-to-ct \
+    --source checkpoints/torchao_model \
+    --output-dir checkpoints/compressed_tensors_model \
+    --device cuda:0
+
+# Asymmetric zero-point conversion (for AWQ / Marlin has_zp=True)
+torchao-to-ct \
+    --source checkpoints/torchao_model \
+    --output-dir checkpoints/compressed_tensors_model \
+    --device cuda:0 \
+    --int4-asymmetric
+```
+
+### 3. Python API
+
 ```python
 from pathlib import Path
-from torchao_to_compressed_tensors_adapter import convert_checkpoint
+from torchao_to_compressed_tensors import convert_checkpoint
 
 # Convert TorchAO model to Compressed-Tensors format
 convert_checkpoint(
@@ -150,23 +219,8 @@ convert_checkpoint(
 )
 ```
 
-### 3. Checkpoint Conversion (CLI)
-```bash
-# Standard conversion (Symmetric INT4, Per-Channel INT8, FP8)
-python torchao_to_compressed_tensors_adapter.py \
-    --source checkpoints/torchao_model \
-    --output checkpoints/compressed_tensors_model \
-    --device cuda:0
+### 4. Load & Run Inference (vLLM / Transformers)
 
-# Asymmetric zero-point conversion (for AWQ / Marlin has_zp=True)
-python torchao_to_compressed_tensors_adapter.py \
-    --source checkpoints/torchao_model \
-    --output checkpoints/compressed_tensors_model \
-    --device cuda:0 \
-    --int4-asymmetric
-```
-
-### 4. Load & Run Inference (Transformers + Compressed-Tensors)
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -186,4 +240,5 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ---
 
 ## 📜 License
-Apache-2.0 License.
+
+This project is licensed under the [Apache-2.0 License](LICENSE).

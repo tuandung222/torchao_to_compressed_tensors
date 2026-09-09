@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torchao-to-compressed-tensors"
+version = "0.2.0"
+description = "A high-performance modular adapter converting PyTorch TorchAO checkpoints into Compressed-Tensors format for vLLM, SGLang, and HuggingFace."
+readme = "README.md"
+authors = [
+    { name = "Tuan Dung", email = "tuandung@example.com" }
+]
+license = { text = "Apache-2.0" }
+keywords = ["quantization", "torchao", "compressed-tensors", "vllm", "llm", "marlin", "int4", "int8", "fp8"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4.0",
+    "torchao>=0.10.0",
+    "compressed-tensors>=0.13.0",
+    "safetensors>=0.4.3",
+    "transformers>=4.44.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "black>=24.0.0",
+    "ruff>=0.5.0",
+]
+
+[project.scripts]
+torchao-to-ct = "torchao_to_compressed_tensors.adapter:main"
+
+[project.urls]
+Homepage = "https://github.com/tuandung222/torchao_to_compressed_tensors"
+Repository = "https://github.com/tuandung222/torchao_to_compressed_tensors"
+"Bug Tracker" = "https://github.com/tuandung222/torchao_to_compressed_tensors/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
