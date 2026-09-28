@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torchao-to-compressed-tensors"
-version = "0.2.0"
-description = "A high-performance modular adapter converting PyTorch TorchAO checkpoints into Compressed-Tensors format for vLLM, SGLang, and HuggingFace."
+version = "0.3.0"
+description = "Convert TorchAO QAT checkpoints to compressed-tensors W4A16 for serving with vLLM's Marlin kernel."
 readme = "README.md"
 authors = [
     { name = "Tuan Dung", email = "tuandung@example.com" }
 ]
 license = { text = "Apache-2.0" }
-keywords = ["quantization", "torchao", "compressed-tensors", "vllm", "llm", "marlin", "int4", "int8", "fp8"]
+keywords = ["quantization", "torchao", "compressed-tensors", "vllm", "llm", "marlin", "int4", "qat"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -26,8 +26,8 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.4.0",
-    "torchao>=0.10.0",
-    "compressed-tensors>=0.13.0",
+    "torchao>=0.13.0",
+    "compressed-tensors>=0.17.0",
     "safetensors>=0.4.3",
     "transformers>=4.44.0",
 ]
@@ -49,3 +49,19 @@ Repository = "https://github.com/tuandung222/torchao_to_compressed_tensors"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "E501",    # long lines are handled by the formatter, not the linter
+    # safetensors' safe_open exposes .keys() but is not a Mapping, so the
+    # suggested `key in f` rewrite does not work.
+    "SIM118",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/*" = ["E402"]

@@ -1,37 +1,40 @@
 #!/usr/bin/env bash
-set -e
+# End-to-end: symmetric W4A16 QAT -> dense checkpoint -> compressed-tensors.
+#
+# Paths are relative to the repository so this runs anywhere; override any of
+# the variables below from the environment.
+set -euo pipefail
 
-PROJECT_DIR="/home/dungvpt/workspace/dungvpt/sprint27/torchao_to_compressed_tensors"
-PYTHON_BIN="/home/uney/miniconda3/envs/axolotl/bin/python"
-GPU_ID=2
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+SOURCE_MODEL="${SOURCE_MODEL:?set SOURCE_MODEL to a dense base model directory or hub id}"
+GROUP_SIZE="${GROUP_SIZE:-128}"
+STEPS="${STEPS:-40}"
+QAT_DIR="${QAT_DIR:-$REPO_DIR/checkpoints/qat_dense}"
+OUT_DIR="${OUT_DIR:-$REPO_DIR/checkpoints/compressed_tensors_model}"
+IGNORE="${IGNORE:-lm_head}"
 
-cd "$PROJECT_DIR"
+cd "$REPO_DIR"
 
-echo "================================================================================"
-echo "🎯 RUNNING END-TO-END PIPELINE: QAT SMOKE FINETUNE -> ADAPTER -> INFERENCE"
-echo "================================================================================"
+echo ">>> [1/3] QAT finetune (symmetric INT4, group_size=$GROUP_SIZE)"
+"$PYTHON_BIN" examples/qat_finetune.py \
+    --source "$SOURCE_MODEL" \
+    --data-file examples/data/behavior_learning_data.json \
+    --steps "$STEPS" \
+    --group-size "$GROUP_SIZE" \
+    --ignore $IGNORE \
+    --output-dir "$QAT_DIR"
 
-echo ""
-echo ">>> STEP 1: Running Smoke QAT Finetuning (TorchAO)..."
-CUDA_VISIBLE_DEVICES=$GPU_ID $PYTHON_BIN smoke_qat_finetune.py \
-    --data-file data/behavior_learning_data.json \
-    --steps 40 \
-    --group-size 128 \
-    --lr 3.5e-5 \
-    --output-dir checkpoints/torchao_model
+echo ">>> [2/3] Convert to compressed-tensors"
+"$PYTHON_BIN" -m torchao_to_compressed_tensors.adapter \
+    --source "$QAT_DIR" \
+    --output-dir "$OUT_DIR" \
+    --group-size "$GROUP_SIZE" \
+    --ignore $IGNORE
 
-echo ""
-echo ">>> STEP 2: Running TorchAO to compressed-tensors Adapter..."
-CUDA_VISIBLE_DEVICES=$GPU_ID $PYTHON_BIN torchao_to_compressed_tensors_adapter.py \
-    --source checkpoints/torchao_model \
-    --output-dir checkpoints/compressed_tensors_model
+echo ">>> [3/3] Verify"
+"$PYTHON_BIN" examples/verify_inference.py --model-dir "$OUT_DIR"
 
-echo ""
-echo ">>> STEP 3: Running Inference Verification on compressed-tensors Checkpoint..."
-CUDA_VISIBLE_DEVICES=$GPU_ID $PYTHON_BIN verify_inference.py \
-    --model-dir checkpoints/compressed_tensors_model
-
-echo ""
-echo "================================================================================"
-echo "🎉 ALL STEPS COMPLETED SUCCESSFULLY!"
-echo "================================================================================"
+echo
+echo "Done. Serve with:  vllm serve $OUT_DIR"
+echo "Confirm the log reports: Using MarlinLinearKernel for CompressedTensorsWNA16"

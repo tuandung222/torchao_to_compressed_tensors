@@ -1,43 +1,61 @@
 """
-TorchAO to Compressed-Tensors Adapter
-A high-performance adapter for converting TorchAO checkpoints into Compressed-Tensors format.
+TorchAO QAT -> compressed-tensors W4A16, for serving with vLLM's Marlin kernel.
+
+Scope is deliberately one scheme wide; see docs/SCOPE.md for what was removed
+and why.
 """
 
-from .schemas import (
-    SchemaType,
-    detect_tensor_schema,
-    extract_prefix,
-    extract_group_size_from_config,
-)
-from .handlers import (
-    convert_int4_tinygemm,
-    convert_int4_plain,
-    convert_int4_preshuffled,
-    convert_int8_weight_only,
-    convert_int8_dynamic_act,
-    convert_int8_static_act,
-    convert_fp8_weight_only,
-    convert_fp8_dynamic_act,
-)
-from .config import generate_compressed_tensors_config
 from .adapter import convert_checkpoint, main
+from .config import build_model_config, build_quantization_config
+from .handlers import dequantize_tinygemm
+from .qat import (
+    DEFAULT_IGNORE,
+    MARLIN_GROUP_SIZES,
+    convert_w4a16_qat,
+    patch_axolotl_qat,
+    prepare_w4a16_qat,
+    validate_group_size,
+    w4a16_convert_config,
+    w4a16_qat_config,
+)
+from .quantize import QuantizedWeight, make_quantization_args, quantize_weight
+from .schemas import (
+    ModuleKind,
+    SourceFormat,
+    classify_modules,
+    detect_source_format,
+    extract_group_size,
+    iter_quantizable_weights,
+)
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
-__all__ = [
-    "SchemaType",
-    "detect_tensor_schema",
-    "extract_prefix",
-    "extract_group_size_from_config",
-    "convert_int4_tinygemm",
-    "convert_int4_plain",
-    "convert_int4_preshuffled",
-    "convert_int8_weight_only",
-    "convert_int8_dynamic_act",
-    "convert_int8_static_act",
-    "convert_fp8_weight_only",
-    "convert_fp8_dynamic_act",
-    "generate_compressed_tensors_config",
+# Grouped by role rather than sorted; the grouping is the documentation.
+__all__ = [  # noqa: RUF022
+    # QAT
+    "MARLIN_GROUP_SIZES",
+    "DEFAULT_IGNORE",
+    "w4a16_qat_config",
+    "w4a16_convert_config",
+    "prepare_w4a16_qat",
+    "convert_w4a16_qat",
+    "validate_group_size",
+    "patch_axolotl_qat",
+    # Quantisation
+    "QuantizedWeight",
+    "make_quantization_args",
+    "quantize_weight",
+    # Source inspection
+    "SourceFormat",
+    "ModuleKind",
+    "detect_source_format",
+    "extract_group_size",
+    "classify_modules",
+    "iter_quantizable_weights",
+    "dequantize_tinygemm",
+    # Config + entrypoint
+    "build_quantization_config",
+    "build_model_config",
     "convert_checkpoint",
     "main",
 ]

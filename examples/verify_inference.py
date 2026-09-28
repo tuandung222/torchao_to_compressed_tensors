@@ -1,217 +1,149 @@
 #!/usr/bin/env python3
 """
-Verify Inference for the converted compressed-tensors checkpoint.
-Tests loading the checkpoint, verifying weight shapes and data integrity,
-and running a forward generation pass on a sample document.
+Structural and inference checks on a converted compressed-tensors checkpoint.
+
+Checks what can be checked without a GPU: that the config is a valid
+compressed-tensors block, that every quantised layer carries a consistent set of
+tensors, that the packed weights unpack to their declared shape, and that the
+model loads and generates. Kernel selection itself is only observable when vLLM
+loads the checkpoint on the target GPU -- see the note printed at the end.
 """
 
 import argparse
 import json
-import sys
-import time
 from pathlib import Path
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from compressed_tensors.quantization import QuantizationConfig
 from safetensors import safe_open
-from compressed_tensors.compressors.quantized_compressors.pack_quantized import unpack_from_int32
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+try:
+    from compressed_tensors.compressors.pack_quantized import unpack_from_int32
+except ImportError:  # pragma: no cover
+    from compressed_tensors.compressors.quantized_compressors.pack_quantized import (
+        unpack_from_int32,
+    )
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Verify inference for converted compressed-tensors checkpoint")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model-dir",
-        type=str,
-        default="/home/dungvpt/workspace/dungvpt/sprint27/torchao_to_compressed_tensors/checkpoints/compressed_tensors_model",
-        help="Path to converted model directory",
+        type=Path,
+        default=REPO_ROOT / "checkpoints" / "compressed_tensors_model",
     )
     parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda:0" if torch.cuda.is_available() else "cpu",
-        help="Device to run inference on",
+        "--device", default="cuda:0" if torch.cuda.is_available() else "cpu"
     )
+    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--skip-generation", action="store_true")
     return parser.parse_args()
 
 
-def verify_checkpoint_integrity(model_dir: Path):
-    print("[1/3] Verifying checkpoint metadata & tensor layout...", flush=True)
-    config_path = model_dir / "config.json"
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    qcfg = cfg.get("quantization_config", {})
-    assert qcfg.get("quant_method") == "compressed-tensors", f"Unexpected quant_method: {qcfg.get('quant_method')}"
-    assert qcfg.get("format") == "pack-quantized", f"Unexpected format: {qcfg.get('format')}"
-    print(f"      config.json quant_method: {qcfg.get('quant_method')}, format: {qcfg.get('format')}")
-
-    safetensors_path = model_dir / "model.safetensors"
-    assert safetensors_path.exists(), f"Missing {safetensors_path}"
-
-    with safe_open(safetensors_path, framework="pt") as f:
-        keys = list(f.keys())
-        packed_keys = [k for k in keys if k.endswith(".weight_packed")]
-        scale_keys = [k for k in keys if k.endswith(".weight_scale")]
-        shape_keys = [k for k in keys if k.endswith(".weight_shape")]
-
-        print(f"      Total keys in safetensors: {len(keys)}")
-        print(f"      Packed linear layers    : {len(packed_keys)}")
-        print(f"      Scale tensors           : {len(scale_keys)}")
-        print(f"      Shape metadata tensors  : {len(shape_keys)}")
-
-        assert len(packed_keys) > 0, "No packed weights found!"
-        assert len(packed_keys) == len(scale_keys) == len(shape_keys), "Mismatch in packed parameter triplets!"
-
-        # Spot check layer 0 q_proj
-        sample_packed_key = packed_keys[0]
-        sample_prefix = sample_packed_key[:-len(".weight_packed")]
-        packed_t = f.get_tensor(sample_packed_key)
-        scale_t = f.get_tensor(f"{sample_prefix}.weight_scale")
-        shape_t = f.get_tensor(f"{sample_prefix}.weight_shape")
-
-        print(f"      Sample layer ({sample_prefix}):")
-        print(f"         weight_packed shape : {packed_t.shape}, dtype: {packed_t.dtype}")
-        print(f"         weight_scale shape  : {scale_t.shape}, dtype: {scale_t.dtype}")
-        print(f"         weight_shape value  : {shape_t.tolist()}")
-
-        # Validate unpack
-        orig_shape = torch.Size(shape_t.tolist())
-        unpacked_int8 = unpack_from_int32(packed_t, num_bits=4, shape=orig_shape)
-        assert unpacked_int8.shape == orig_shape, f"Unpacked shape {unpacked_int8.shape} != {orig_shape}"
-        assert unpacked_int8.dtype == torch.int8, f"Unpacked dtype {unpacked_int8.dtype} != torch.int8"
-        print("      ✅ Unpack validation succeeded! Bit-repacking is sound and fully valid.")
+def load_tensors(model_dir: Path) -> dict[str, torch.Tensor]:
+    tensors = {}
+    for shard in sorted(model_dir.glob("*.safetensors")):
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            if f.metadata() is None or f.metadata().get("format") != "pt":
+                raise AssertionError(f"{shard.name} is missing metadata format=pt")
+            for key in f.keys():
+                tensors[key] = f.get_tensor(key)
+    return tensors
 
 
-def run_inference_test(model_dir: Path, device: str):
-    print("[2/3] Loading model into HuggingFace Transformers with compressed-tensors...", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-    
-    # Load model with transformers
-    start_load = time.time()
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            device_map=device,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            attn_implementation="eager",
+def verify_structure(model_dir: Path) -> None:
+    print("[1/2] Verifying checkpoint structure ...", flush=True)
+
+    config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    parsed = QuantizationConfig.model_validate(config["quantization_config"])
+    weights = parsed.config_groups["group_0"].weights
+    print(
+        f"      format={parsed.format} num_bits={weights.num_bits} "
+        f"strategy={weights.strategy} group_size={weights.group_size} "
+        f"symmetric={weights.symmetric} ignore={parsed.ignore}",
+        flush=True,
+    )
+    assert parsed.format == "pack-quantized", parsed.format
+
+    if weights.group_size not in (32, 64, 128):
+        raise AssertionError(
+            f"group_size={weights.group_size} is not Marlin-servable; vLLM will "
+            "fall back to a slower kernel"
         )
-        model.tie_weights()
-        model.eval()
-        print(f"      Model loaded in {time.time() - start_load:.2f}s! Architecture: {type(model).__name__}", flush=True)
 
-        print("[3/3] Running generation test on unseen prompts for learned behavior...", flush=True)
-        # Unseen Prompt 1: Quantum Computing
-        test_text1 = (
-            "Quantum computing leverages superposition and entanglement to perform complex matrix calculations "
-            "exponentially faster than classical computers for specific cryptographic and scientific algorithms."
+    tensors = load_tensors(model_dir)
+    prefixes = sorted(
+        k[: -len(".weight_packed")] for k in tensors if k.endswith(".weight_packed")
+    )
+    assert prefixes, "no packed weights found"
+    print(f"      {len(prefixes)} quantised layers, {len(tensors)} tensors", flush=True)
+
+    for prefix in prefixes:
+        scale = tensors[f"{prefix}.weight_scale"]
+        shape = torch.Size(tensors[f"{prefix}.weight_shape"].tolist())
+        unpacked = unpack_from_int32(tensors[f"{prefix}.weight_packed"], 4, shape)
+
+        assert unpacked.shape == shape, f"{prefix}: {unpacked.shape} != {shape}"
+        assert unpacked.dtype == torch.int8, f"{prefix}: {unpacked.dtype}"
+        assert unpacked.min() >= -8 and unpacked.max() <= 7, f"{prefix}: out of range"
+        assert scale.shape == (shape[0], shape[1] // weights.group_size), (
+            f"{prefix}: scale shape {tuple(scale.shape)} inconsistent with "
+            f"weight shape {tuple(shape)} at group_size={weights.group_size}"
         )
-        msg1 = [{"role": "user", "content": f"Summarize compactly and faithfully.\n\n{test_text1}"}]
-        prompt1 = tokenizer.apply_chat_template(msg1, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        inputs1 = tokenizer(prompt1, return_tensors="pt").to(device)
 
-        start_gen = time.time()
-        with torch.no_grad():
-            outputs1 = model.generate(**inputs1, max_new_tokens=64, repetition_penalty=1.15, do_sample=False)
-        gen_text1 = tokenizer.decode(outputs1[0][inputs1.input_ids.shape[1]:], skip_special_tokens=True).strip()
-        gen_time1 = time.time() - start_gen
+        zero_point = tensors.get(f"{prefix}.weight_zero_point")
+        if weights.symmetric:
+            assert zero_point is None, f"{prefix}: symmetric export carries a zero-point"
+        else:
+            assert zero_point is not None, f"{prefix}: asymmetric export lacks a zero-point"
+            assert zero_point.dtype == torch.int32, f"{prefix}: {zero_point.dtype}"
+            assert tuple(zero_point.shape) == (-(-shape[0] // 8), scale.shape[-1])
 
-        # Unseen Prompt 2: Mobile Release
-        test_text2 = (
-            "The mobile release was scheduled for 12 September. After testing found two "
-            "critical authentication defects, the team moved it to 19 September. Maya owns "
-            "both fixes, and regression testing must finish by 17 September."
+    print("      all layers consistent", flush=True)
+
+
+def verify_inference(model_dir: Path, device: str, max_new_tokens: int) -> None:
+    print("[2/2] Loading and generating ...", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.bfloat16)
+    model.to(device).eval()
+
+    prompt = "Summarize compactly: Machine learning models need optimization to serve efficiently."
+    if tokenizer.chat_template:
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
         )
-        msg2 = [{"role": "user", "content": f"Summarize compactly and faithfully.\n\n{test_text2}"}]
-        prompt2 = tokenizer.apply_chat_template(msg2, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        inputs2 = tokenizer(prompt2, return_tensors="pt").to(device)
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
-        start_gen2 = time.time()
-        with torch.no_grad():
-            outputs2 = model.generate(**inputs2, max_new_tokens=64, repetition_penalty=1.15, do_sample=False)
-        gen_text2 = tokenizer.decode(outputs2[0][inputs2.input_ids.shape[1]:], skip_special_tokens=True).strip()
-        gen_time2 = time.time() - start_gen2
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    generated = tokenizer.decode(
+        outputs[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
+    ).strip()
 
-        print("\n" + "=" * 80)
-        print(f"📝 TEST 1 (Unseen Prompt - Quantum Computing, {gen_time1:.2f}s):")
-        print("=" * 80)
-        print(f"INPUT:\n{test_text1}\n")
-        print(f"OUTPUT:\n{gen_text1}\n")
-        p1 = "[TLDR]" in gen_text1
-        s1 = "VERIFIED" in gen_text1
-        print(f"Prefix [TLDR] detected: {p1} | Suffix VERIFIED detected: {s1}")
-        print(f"Behavior verification: {'🎯 PASSED' if (p1 and s1) else '❌ FAILED'}")
-
-        print("-" * 80)
-        print(f"📝 TEST 2 (Unseen Prompt - Mobile Release, {gen_time2:.2f}s):")
-        print("-" * 80)
-        print(f"INPUT:\n{test_text2}\n")
-        print(f"OUTPUT:\n{gen_text2}\n")
-        p2 = "[TLDR]" in gen_text2
-        s2 = "VERIFIED" in gen_text2
-        print(f"Prefix [TLDR] detected: {p2} | Suffix VERIFIED detected: {s2}")
-        print(f"Behavior verification: {'🎯 PASSED' if (p2 and s2) else '❌ FAILED'}")
-        print("=" * 80)
-        print("✅ SUCCESS: Checkpoint inferred cleanly without error, NaN, or shape mismatch!")
-        print("=" * 80, flush=True)
-
-    except Exception as e:
-        print(f"⚠️ Transformers direct load note: {e}", flush=True)
-        print("Running standalone forward validation using decompressed weights...", flush=True)
-        
-        # Standalone verification using decompressed weights from model.safetensors
-        config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-        if hasattr(config, "quantization_config"):
-            delattr(config, "quantization_config")
-        
-        with torch.device("meta"):
-            meta_m = AutoModelForCausalLM.from_config(config, dtype=torch.bfloat16)
-        m = meta_m.to_empty(device=device)
-
-        # Decompress packed weights
-        clean_state = {}
-        with safe_open(model_dir / "model.safetensors", framework="pt") as f:
-            for k in f.keys():
-                if k.endswith(".weight_packed"):
-                    prefix = k[:-len(".weight_packed")]
-                    packed_t = f.get_tensor(k)
-                    scale_t = f.get_tensor(f"{prefix}.weight_scale")
-                    shape_t = f.get_tensor(f"{prefix}.weight_shape")
-                    orig_shape = torch.Size(shape_t.tolist())
-                    
-                    unpacked = unpack_from_int32(packed_t, num_bits=4, shape=orig_shape).to(device)
-                    # dequant: (unpacked.float() * scale)
-                    group_size = orig_shape[1] // scale_t.shape[1]
-                    scale_exp = scale_t.to(device).repeat_interleave(group_size, dim=1)
-                    dequant_w = (unpacked.to(torch.float32) * scale_exp.to(torch.float32)).to(torch.bfloat16)
-                    clean_state[f"{prefix}.weight"] = dequant_w
-                elif not k.endswith(".weight_scale") and not k.endswith(".weight_shape"):
-                    clean_state[k] = f.get_tensor(k).to(device)
-
-        m.load_state_dict(clean_state, strict=False)
-        m.eval()
-
-        test_text = "Summarize compactly: Artificial intelligence is advancing rapidly."
-        inputs = tokenizer(test_text, return_tensors="pt").to(device)
-        with torch.no_grad():
-            out = m.generate(**inputs, max_new_tokens=32, do_sample=False)
-        res = tokenizer.decode(out[0], skip_special_tokens=True)
-        print("Generated with unpacked weights:\n", res)
-        print("✅ SUCCESS: Decompressed weights produce valid logits and tokens!")
+    print(f"      generated: {generated!r}", flush=True)
+    assert generated, "generation returned an empty string"
 
 
-def main():
+def main() -> None:
     args = parse_args()
-    model_dir = Path(args.model_dir)
+    verify_structure(args.model_dir)
+    if not args.skip_generation:
+        verify_inference(args.model_dir, args.device, args.max_new_tokens)
 
-    print("=" * 80)
-    print("🔍 VERIFYING INFERENCE FOR COMPRESSED-TENSORS MODEL")
-    print(f"   Model directory : {model_dir}")
-    print(f"   Device          : {args.device}")
-    print("=" * 80, flush=True)
-
-    verify_checkpoint_integrity(model_dir)
-    run_inference_test(model_dir, args.device)
+    print(
+        "\nStructure and inference are sound. Kernel selection is only decided "
+        "when vLLM loads this on the target GPU -- run `vllm serve` and confirm "
+        "the log line:\n"
+        "  Using MarlinLinearKernel for CompressedTensorsWNA16",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

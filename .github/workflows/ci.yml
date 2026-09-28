@@ -10,28 +10,29 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
 
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
-        
-    - name: Install Dependencies
+
+    - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install -e .
-        pip install pytest ruff
-        
-    - name: Code Quality & Lint
-      run: |
-        ruff check src/ tests/
-        
-    - name: Run Tests (CPU parity & schema unit tests)
-      run: |
-        pytest tests/ -k "not test_tier4" -v || true
+        pip install torch --index-url https://download.pytorch.org/whl/cpu
+        pip install -e ".[dev]"
+
+    - name: Lint
+      run: ruff check src/ tests/
+
+    # The whole suite is CPU-only by design: grid parity and round-trip are
+    # numerical properties, not kernel properties. No `|| true` -- a red test
+    # here means a checkpoint that serves wrong.
+    - name: Test
+      run: pytest tests/ -v
